@@ -52,8 +52,8 @@ use wasmer_wasix::{
 use crate::{
     config::{UserRegistry, WasmerEnv},
     utils::{
-        WAPM_SOURCE_CACHE_TIMEOUT, parse_envvar, parse_mapdir, parse_volume,
-        parse_volume_growth_limit, registry_query_cache_dir,
+        WAPM_SOURCE_CACHE_TIMEOUT, parse_envvar, parse_mapdir, parse_mount, parse_volume,
+        registry_query_cache_dir,
     },
 };
 
@@ -73,21 +73,9 @@ pub struct Wasi {
     )]
     pub(crate) volumes: Vec<MappedDirectory>,
 
-    /// Map a host directory read-only into the Wasm module.
-    #[clap(
-        long = "volume-read-only",
-        value_name = "[HOST_DIR:]GUEST_DIR",
-        value_parser = parse_volume,
-    )]
-    pub(crate) read_only_volumes: Vec<MappedDirectory>,
-
-    /// Limit approximate net file growth initiated by the guest through a mounted volume.
-    #[clap(
-        long = "volume-growth-limit",
-        value_name = "GUEST_DIR=MAX_BYTES",
-        value_parser = parse_volume_growth_limit,
-    )]
-    pub(crate) volume_growth_limits: Vec<(String, u64)>,
+    /// Map a directory with a JSON object: source, target, read_only, max_growth_bytes.
+    #[clap(long = "mount", value_name = "JSON", value_parser = parse_mount)]
+    pub(crate) mounts: Vec<MappedDirectory>,
 
     // Legacy option
     #[clap(long = "dir", group = "wasi", hide = true)]
@@ -311,10 +299,7 @@ impl Wasi {
         self.volumes
             .iter()
             .cloned()
-            .chain(self.read_only_volumes.iter().cloned().map(|mut volume| {
-                volume.read_only = true;
-                volume
-            }))
+            .chain(self.mounts.iter().cloned())
             .chain(self.pre_opened_directories.iter().map(|d| MappedDirectory {
                 host: d.clone(),
                 guest: d.to_str().expect("must be a valid path string").to_string(),
@@ -499,16 +484,6 @@ impl Wasi {
                 guest
             })
         };
-        let mut growth_limits = HashMap::new();
-        for (guest, maximum_growth_bytes) in &self.volume_growth_limits {
-            if growth_limits
-                .insert(normalize_guest(guest)?, *maximum_growth_bytes)
-                .is_some()
-            {
-                bail!("Volume growth limit for '{guest}' was specified more than once");
-            }
-        }
-
         let mut have_current_dir = false;
         let mut guest_paths = BTreeSet::new();
         for mut volume in self.all_volumes() {
@@ -517,13 +492,6 @@ impl Wasi {
                 bail!(
                     "Volume guest directory '{}' was mounted more than once",
                     normalized_guest.display()
-                );
-            }
-            volume.maximum_growth_bytes = growth_limits.remove(&normalized_guest);
-            if volume.read_only && volume.maximum_growth_bytes.is_some() {
-                bail!(
-                    "Read-only volume '{}' cannot have a growth limit",
-                    volume.guest
                 );
             }
             volume.host = volume.host.canonicalize().with_context(|| {
@@ -552,13 +520,6 @@ impl Wasi {
                 .to_string();
             }
             mapped_dirs.push(volume);
-        }
-
-        if let Some(guest) = growth_limits.keys().next() {
-            bail!(
-                "Volume growth limit refers to unknown guest directory '{}'",
-                guest.display()
-            );
         }
 
         Ok((have_current_dir, mapped_dirs))
@@ -857,17 +818,9 @@ mod volume_policy_tests {
         let directory = tempfile::tempdir().unwrap();
         let volume = format!("{}:/data", directory.path().display());
         for alias in ["/data", "/data/", "data", "/other/../data"] {
-            let duplicate = format!("{}:{alias}", directory.path().display());
-            let wasi = Wasi::try_parse_from([
-                "wasi",
-                "--volume",
-                &volume,
-                "--volume",
-                &duplicate,
-                "--volume-growth-limit",
-                "/data=4",
-            ])
-            .unwrap();
+            let duplicate = serde_json::json!({"source": directory.path(), "target": alias, "max_growth_bytes": 4}).to_string();
+            let wasi =
+                Wasi::try_parse_from(["wasi", "--volume", &volume, "--mount", &duplicate]).unwrap();
             let error = wasi.build_mapped_directories(true).unwrap_err();
             assert!(
                 error.to_string().contains("mounted more than once"),
@@ -877,41 +830,17 @@ mod volume_policy_tests {
     }
 
     #[test]
-    fn matches_normalized_limits_and_preserves_current_directory() {
+    fn mount_preserves_current_directory_and_policy() {
         let directory = tempfile::tempdir().unwrap();
-        for (guest, limit, expected_guest, expected_current_dir) in [
-            ("/data/", "/other/../data=4", "/data/", false),
-            (".", "/home/=4", "/home", true),
-        ] {
-            let volume = format!("{}:{guest}", directory.path().display());
-            let wasi =
-                Wasi::try_parse_from(["wasi", "--volume", &volume, "--volume-growth-limit", limit])
-                    .unwrap();
+        for (guest, expected_guest, expected_current_dir) in
+            [("/data/", "/data/", false), (".", "/home", true)]
+        {
+            let mount = serde_json::json!({"source": directory.path(), "target": guest, "max_growth_bytes": 4}).to_string();
+            let wasi = Wasi::try_parse_from(["wasi", "--mount", &mount]).unwrap();
             let (current_dir, mounts) = wasi.build_mapped_directories(true).unwrap();
             assert_eq!(current_dir, expected_current_dir);
             assert_eq!(mounts[0].guest, expected_guest);
             assert_eq!(mounts[0].maximum_growth_bytes, Some(4));
         }
-    }
-
-    #[test]
-    fn rejects_duplicate_limits_after_normalization() {
-        let directory = tempfile::tempdir().unwrap();
-        let volume = format!("{}:/data", directory.path().display());
-        let wasi = Wasi::try_parse_from([
-            "wasi",
-            "--volume",
-            &volume,
-            "--volume-growth-limit",
-            "/data=4",
-            "--volume-growth-limit",
-            "/data/=8",
-        ])
-        .unwrap();
-        let error = wasi.build_mapped_directories(true).unwrap_err();
-        assert!(
-            error.to_string().contains("specified more than once"),
-            "{error}"
-        );
     }
 }

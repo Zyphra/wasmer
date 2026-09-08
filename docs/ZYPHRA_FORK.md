@@ -7,9 +7,17 @@ branch is `zyphra`; upstream is `https://github.com/wasmerio/wasmer.git`.
 The initial base is upstream `v7.2.1`, commit
 `c14032594b893b40e9b71456d504cf55c141c8f6`.
 
-The CLI accepts `--volume-read-only HOST:GUEST` and
-`--volume-growth-limit GUEST=MAX_BYTES`. Limits are optional and expressed in
-bytes. Guest destinations are normalized before duplicate and policy validation.
+The CLI accepts one JSON mount declaration, for example:
+
+```sh
+--mount '{"source":"/host/cache","target":"/cache","max_growth_bytes":104857600}'
+--mount '{"source":"/host/input","target":"/input","read_only":true}'
+```
+
+The original `--volume HOST:GUEST` remains supported. Limits are optional byte
+counts; read-only mounts cannot also specify a growth limit. JSON preserves path
+characters without custom delimiter escaping and rejects unknown/duplicate fields.
+Guest destinations are normalized before duplicate and policy validation.
 The corresponding `MappedDirectory` fields default to writable and unlimited.
 
 ## Accounting choices
