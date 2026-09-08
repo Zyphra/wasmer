@@ -331,9 +331,11 @@ impl From<Errno> for std::io::ErrorKind {
             Errno::Noent => ErrorKind::NotFound,
             Errno::Nomem => ErrorKind::OutOfMemory,
             Errno::Nomsg => ErrorKind::InvalidData,
+            Errno::Nospc => ErrorKind::StorageFull,
             Errno::Notconn => ErrorKind::NotConnected,
             Errno::Perm => ErrorKind::PermissionDenied,
             Errno::Pipe => ErrorKind::BrokenPipe,
+            Errno::Rofs => ErrorKind::ReadOnlyFilesystem,
             Errno::Timedout => ErrorKind::TimedOut,
             _ => ErrorKind::Other,
         }
@@ -353,6 +355,7 @@ impl From<std::io::Error> for Errno {
         match err.kind() {
             ErrorKind::NotFound => Errno::Noent,
             ErrorKind::PermissionDenied => Errno::Perm,
+            ErrorKind::ReadOnlyFilesystem => Errno::Rofs,
             ErrorKind::ConnectionRefused => Errno::Connrefused,
             ErrorKind::ConnectionReset => Errno::Connreset,
             ErrorKind::ConnectionAborted => Errno::Connaborted,
@@ -366,6 +369,7 @@ impl From<std::io::Error> for Errno {
             ErrorKind::InvalidData => Errno::Io,
             ErrorKind::TimedOut => Errno::Timedout,
             ErrorKind::WriteZero => Errno::Io,
+            ErrorKind::StorageFull => Errno::Nospc,
             ErrorKind::Interrupted => Errno::Intr,
             ErrorKind::Other => Errno::Io,
             ErrorKind::UnexpectedEof => Errno::Io,

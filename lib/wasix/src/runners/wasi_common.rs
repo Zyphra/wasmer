@@ -177,40 +177,6 @@ impl CommonWasiOptions {
 // type ContainerFs =
 //     OverlayFileSystem<TmpFileSystem, [RelativeOrAbsolutePathHack<Arc<dyn FileSystem>>; 1]>;
 
-fn normalized_mount_path(guest_path: &str) -> Result<PathBuf, Error> {
-    let mut guest_path = PathBuf::from(guest_path);
-
-    if guest_path.is_relative() {
-        guest_path = apply_relative_path_mounting_hack(&guest_path);
-    }
-
-    let mut normalized = PathBuf::from("/");
-    for component in guest_path.components() {
-        match component {
-            Component::RootDir => normalized = PathBuf::from("/"),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if normalized.as_os_str() == "/" {
-                    anyhow::bail!(
-                        "Invalid guest mount path \"{}\": parent traversal escapes the virtual root",
-                        guest_path.display()
-                    );
-                }
-                normalized.pop();
-            }
-            Component::Normal(part) => normalized.push(part),
-            Component::Prefix(_) => {
-                anyhow::bail!(
-                    "Invalid guest mount path \"{}\": platform-specific prefixes are not supported",
-                    guest_path.display()
-                );
-            }
-        }
-    }
-
-    Ok(normalized)
-}
-
 fn prepare_filesystem(
     base_root: Arc<dyn FileSystem + Send + Sync>,
     memory_limiter: Option<&DynFsMemoryLimiter>,
@@ -222,7 +188,7 @@ fn prepare_filesystem(
     let mount_fs = MountFileSystem::new();
 
     for MountedDirectory { guest, fs } in mounted_dirs {
-        let guest_path = normalized_mount_path(guest)?;
+        let guest_path = MappedDirectory::normalize_guest_path(guest)?;
         tracing::debug!(guest=%guest_path.display(), "Mounting");
 
         if guest_path == Path::new("/") {
@@ -389,15 +355,64 @@ pub struct MappedDirectory {
     /// The absolute path specifying where the host directory should be mounted
     /// inside the guest.
     pub guest: String,
+    /// Present the mounted directory to the guest without mutation rights.
+    #[serde(default)]
+    pub read_only: bool,
+    /// Maximum approximate net file growth initiated by the guest through this mount.
+    #[serde(default)]
+    pub maximum_growth_bytes: Option<u64>,
+}
+
+impl MappedDirectory {
+    /// Normalize a guest mount destination, rejecting traversal above the guest root.
+    pub fn normalize_guest_path(guest_path: &str) -> Result<PathBuf, Error> {
+        let mut guest_path = PathBuf::from(guest_path);
+
+        if guest_path.is_relative() {
+            guest_path = apply_relative_path_mounting_hack(&guest_path);
+        }
+
+        let mut normalized = PathBuf::from("/");
+        for component in guest_path.components() {
+            match component {
+                Component::RootDir => normalized = PathBuf::from("/"),
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if normalized.as_os_str() == "/" {
+                        anyhow::bail!(
+                            "Invalid guest mount path \"{}\": parent traversal escapes the virtual root",
+                            guest_path.display()
+                        );
+                    }
+                    normalized.pop();
+                }
+                Component::Normal(part) => normalized.push(part),
+                Component::Prefix(_) => {
+                    anyhow::bail!(
+                        "Invalid guest mount path \"{}\": platform-specific prefixes are not supported",
+                        guest_path.display()
+                    );
+                }
+            }
+        }
+
+        Ok(normalized)
+    }
 }
 
 impl From<MappedDirectory> for MountedDirectory {
     fn from(value: MappedDirectory) -> Self {
         cfg_if::cfg_if! {
             if #[cfg(feature = "host-fs")] {
-                let MappedDirectory { host, guest } = value;
-                let fs: Arc<dyn FileSystem + Send + Sync> =
-                    Arc::new(virtual_fs::host_fs::FileSystem::new(Handle::current(), host).unwrap());
+                let MappedDirectory { host, guest, read_only, maximum_growth_bytes } = value;
+                let host_fs = virtual_fs::host_fs::FileSystem::new(Handle::current(), host).unwrap();
+                let mut fs: Arc<dyn FileSystem + Send + Sync> = Arc::new(host_fs);
+                if let Some(maximum_growth_bytes) = maximum_growth_bytes {
+                    fs = Arc::new(virtual_fs::QuotaFileSystem::new(fs, maximum_growth_bytes));
+                }
+                if read_only {
+                    fs = Arc::new(virtual_fs::ReadOnlyFileSystem::new(fs));
+                }
 
                 MountedDirectory { guest, fs }
             } else {
@@ -538,6 +553,8 @@ mod tests {
         let mapping = [MountedDirectory::from(MappedDirectory {
             guest: "/home".to_string(),
             host: sub_dir,
+            read_only: false,
+            maximum_growth_bytes: None,
         })];
         let container = wasmer_package::utils::from_bytes(PYTHON).unwrap();
         let webc_fs = virtual_fs::WebcVolumeFileSystem::mount_all(&container);
@@ -847,7 +864,7 @@ mod tests {
 
     #[test]
     fn invalid_guest_mount_paths_are_rejected() {
-        let error = normalized_mount_path("../../python").unwrap_err();
+        let error = MappedDirectory::normalize_guest_path("../../python").unwrap_err();
         assert!(
             error
                 .to_string()
@@ -863,6 +880,8 @@ mod tests {
         let dir = MappedDirectory {
             guest: "/mnt/dir".to_string(),
             host: temp.path().to_path_buf(),
+            read_only: false,
+            maximum_growth_bytes: None,
         };
         let contents = "Hello, World!";
         let file_txt = temp.path().join("file.txt");

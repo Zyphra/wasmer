@@ -73,64 +73,35 @@ pub(crate) fn path_unlink_file_internal(
         }
     };
 
-    let removed_inode = {
-        let mut guard = parent_inode.write();
-        match guard.deref_mut() {
-            Kind::Dir { entries, .. } => {
-                let removed_inode = wasi_try_ok!(entries.remove(&child_name).ok_or(Errno::Inval));
-                // TODO: make this a debug assert in the future
-                assert!(inode.ino() == removed_inode.ino());
-                debug_assert!(inode.stat.read().unwrap().st_nlink > 0);
-                removed_inode
-            }
-            Kind::Root { .. } => return Ok(Errno::Access),
-            _ => unreachable!(
-                "Internal logic error in wasi::path_unlink_file, parent is not a directory"
-            ),
+    // Serialize namespace removal with opening and replacing shared handles.
+    let _fd_map = state.fs.fd_map.write().unwrap();
+    let (backing_path, is_symlink) = {
+        let guard = inode.read();
+        match guard.deref() {
+            Kind::File { path, .. } => (path.clone(), false),
+            Kind::Symlink { .. } => (host_adjusted_path, true),
+            Kind::Dir { .. } | Kind::Root { .. } => return Ok(Errno::Isdir),
+            _ => return Ok(Errno::Inval),
         }
     };
-
-    let st_nlink = {
-        let mut guard = removed_inode.stat.write().unwrap();
-        guard.st_nlink -= 1;
-        guard.st_nlink
-    };
-    if st_nlink == 0 {
-        {
-            let mut guard = removed_inode.read();
-            match guard.deref() {
-                Kind::File { handle, path, .. } => {
-                    if let Some(h) = handle {
-                        let mut h = h.write().unwrap();
-                        wasi_try_ok!(h.unlink().map_err(fs_error_into_wasi_err));
-                    } else {
-                        // File is closed
-                        // problem with the abstraction, we can't call unlink because there's no handle
-                        // drop mutable borrow on `path`
-                        let path = path.clone();
-                        drop(guard);
-                        wasi_try_ok!(state.fs_remove_file(path));
-                    }
-                }
-                Kind::Dir { .. } | Kind::Root { .. } => return Ok(Errno::Isdir),
-                Kind::Symlink { .. } => {
-                    match state.fs_remove_file(host_adjusted_path.as_path()) {
-                        Ok(()) => {}
-                        Err(Errno::Noent)
-                            if state
-                                .fs
-                                .ephemeral_symlink_at(host_adjusted_path.as_path())
-                                .is_some() => {}
-                        Err(err) => return Ok(err),
-                    }
-                    state
-                        .fs
-                        .unregister_ephemeral_symlink(host_adjusted_path.as_path());
-                }
-                _ => unimplemented!("wasi::path_unlink_file for Buffer"),
-            }
+    if inode.stat.read().unwrap().st_nlink == 1 {
+        wasi_try_ok!(__asyncify_light(env, None, inode.flush())?);
+        match state.fs_remove_file(&backing_path) {
+            Ok(()) => {}
+            Err(Errno::Noent)
+                if is_symlink && state.fs.ephemeral_symlink_at(&backing_path).is_some() => {}
+            Err(error) => return Ok(error),
+        }
+        if is_symlink {
+            state.fs.unregister_ephemeral_symlink(&backing_path);
         }
     }
-
+    {
+        let mut guard = parent_inode.write();
+        if let Kind::Dir { entries, .. } = guard.deref_mut() {
+            entries.remove(&child_name);
+        }
+    }
+    inode.on_unlink();
     Ok(Errno::Success)
 }

@@ -190,7 +190,6 @@ impl crate::FileSystem for FileSystem {
 
     fn rename<'a>(&'a self, from: &'a Path, to: &'a Path) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            use filetime::{FileTime, set_file_mtime};
             let norm_from = normalize_path(from);
             let norm_to = normalize_path(to);
 
@@ -204,41 +203,7 @@ impl crate::FileSystem for FileSystem {
             let from = self.prepare_path(from)?;
             let to = self.prepare_path(to)?;
 
-            if !from.exists() {
-                return Err(FsError::EntryNotFound);
-            }
-            let from_parent = from.parent().unwrap();
-            let to_parent = to.parent().unwrap();
-            if !from_parent.exists() {
-                return Err(FsError::EntryNotFound);
-            }
-            if !to_parent.exists() {
-                return Err(FsError::EntryNotFound);
-            }
-            let result = if from_parent != to_parent {
-                let _ = std::fs::create_dir_all(to_parent);
-                if from.is_dir() {
-                    fs_extra::move_items(
-                        &[&from],
-                        &to,
-                        &fs_extra::dir::CopyOptions {
-                            copy_inside: true,
-                            ..Default::default()
-                        },
-                    )
-                    .map(|_| ())
-                    .map_err(|_| FsError::UnknownError)?;
-                    let _ = fs_extra::remove_items(&[&from]);
-                    Ok(())
-                } else {
-                    fs::copy(&from, &to).map(|_| ()).map_err(FsError::from)?;
-                    fs::remove_file(&from).map(|_| ()).map_err(Into::into)
-                }
-            } else {
-                fs::rename(&from, &to).map_err(Into::into)
-            };
-            let _ = set_file_mtime(&to, FileTime::now()).map(|_| ());
-            result
+            fs::rename(from, to).map_err(Into::into)
         })
     }
 
@@ -1262,9 +1227,9 @@ mod tests {
         assert!(bar_metadata.ft.dir);
         assert!(bar_metadata.accessed >= foo_metadata.accessed);
         assert_eq!(bar_metadata.created, foo_metadata.created);
-        assert!(bar_metadata.modified > foo_metadata.modified);
+        assert_eq!(bar_metadata.modified, foo_metadata.modified);
 
-        let root_metadata = fs.metadata(bar).unwrap();
+        let root_metadata = fs.metadata(Path::new("/")).unwrap();
         assert!(
             root_metadata.modified > foo_metadata.modified,
             "the parent modified time was updated"

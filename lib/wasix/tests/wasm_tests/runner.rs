@@ -421,14 +421,20 @@ where
                         .with_mapped_directories([MappedDirectory {
                             guest: dir.to_string_lossy().to_string(),
                             host: dir.to_path_buf(),
+                            read_only: false,
+                            maximum_growth_bytes: None,
                         }])
                         .with_mapped_directories([MappedDirectory {
                             guest: "/lib".to_string(),
                             host: dir.to_path_buf(),
+                            read_only: false,
+                            maximum_growth_bytes: None,
                         }])
                         .with_mapped_directories([MappedDirectory {
                             guest: "/data".to_string(),
                             host: dir.to_path_buf(),
+                            read_only: false,
+                            maximum_growth_bytes: None,
                         }])
                         .with_current_dir(dir.to_string_lossy().to_string());
                 }

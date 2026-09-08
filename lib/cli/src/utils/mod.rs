@@ -42,6 +42,8 @@ fn retrieve_alias_pathbuf(host_dir: &str, guest_dir: &str) -> Result<MappedDirec
     Ok(MappedDirectory {
         host: host_dir_path,
         guest: guest_dir.to_string(),
+        read_only: false,
+        maximum_growth_bytes: None,
     })
 }
 
@@ -53,6 +55,20 @@ pub fn parse_volume(entry: &str) -> Result<MappedDirectory> {
     } else {
         retrieve_alias_pathbuf(entry, entry)
     }
+}
+
+/// Parses a guest volume growth limit in the form `<GUEST_DIR>=<MAX_BYTES>`.
+pub fn parse_volume_growth_limit(entry: &str) -> Result<(String, u64)> {
+    let (guest, maximum_growth_bytes) = entry
+        .rsplit_once('=')
+        .context("volume growth limit must be <GUEST_DIR>=<MAX_BYTES>")?;
+    if guest.is_empty() {
+        bail!("volume growth limit guest directory cannot be empty");
+    }
+    let maximum_growth_bytes = maximum_growth_bytes
+        .parse::<u64>()
+        .context("volume growth limit must be an integer number of bytes")?;
+    Ok((guest.to_string(), maximum_growth_bytes))
 }
 
 /// Parses a mapdir(legacy option) from a string.
@@ -214,5 +230,16 @@ c: c
             parse_envvar("A=B=C=D").unwrap(),
             ("A".into(), "B=C=D".into())
         );
+    }
+
+    #[test]
+    fn test_parse_volume_growth_limit() {
+        assert_eq!(
+            parse_volume_growth_limit("/shared=1048576").unwrap(),
+            ("/shared".into(), 1_048_576)
+        );
+        assert!(parse_volume_growth_limit("/shared").is_err());
+        assert!(parse_volume_growth_limit("=1").is_err());
+        assert!(parse_volume_growth_limit("/shared=-1").is_err());
     }
 }
