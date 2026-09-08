@@ -163,6 +163,10 @@ pub fn copy_reference_ext<'a>(
 
 /// Move a file across filesystem boundaries by copying it into the destination
 /// and then removing the original.
+///
+/// TODO: synchronize quota accounting with existing open source and destination
+/// handles. Copying can truncate the destination and removing the source refunds
+/// its bytes; stale handles can refund those bytes again on a later shrink.
 pub fn move_across_filesystems<'a>(
     source: &'a (impl FileSystem + ?Sized),
     destination: &'a (impl FileSystem + ?Sized),

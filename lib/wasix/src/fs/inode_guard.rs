@@ -549,6 +549,13 @@ impl VirtualFile for WasiStateFileGuard {
         }
     }
 
+    fn on_unlink(&mut self) {
+        let mut guard = self.lock_write();
+        if let Some(file) = guard.as_mut() {
+            file.on_unlink();
+        }
+    }
+
     fn is_open(&self) -> bool {
         let guard = self.lock_read();
         if let Some(file) = guard.as_ref() {

@@ -65,8 +65,6 @@ pub fn path_rename_internal(
     let env = ctx.data();
     let (memory, mut state, inodes) = unsafe { env.get_memory_and_wasi_state_and_inodes(&ctx, 0) };
 
-    let mut moved_ephemeral_symlink = false;
-
     {
         let source_fd = wasi_try_ok!(state.fs.get_fd(source_fd));
         if !source_fd.inner.rights.contains(Rights::PATH_RENAME_SOURCE) {
@@ -78,17 +76,20 @@ pub fn path_rename_internal(
         }
     }
 
-    // this is to be sure the source file is fetched from the filesystem if needed
     let source_inode = wasi_try_ok!(state.fs.get_inode_at_path(
         inodes,
         source_fd,
         source_path,
-        true
+        false
     ));
-    // Create the destination inode if the file exists.
-    let _ = state
+    let target_inode = match state
         .fs
-        .get_inode_at_path(inodes, target_fd, target_path, true);
+        .get_inode_at_path(inodes, target_fd, target_path, false)
+    {
+        Ok(inode) => Some(inode),
+        Err(Errno::Noent) => None,
+        Err(error) => return Ok(error),
+    };
     let (source_parent_inode, source_entry_name) = wasi_try_ok!(state.fs.get_parent_inode_at_path(
         inodes,
         source_fd,
@@ -108,53 +109,37 @@ pub fn path_rename_internal(
                 .join(&crate::fs::PosixPath::new(&source_entry_name))
                 .into_path_buf(),
             Kind::Root { .. } => return Ok(Errno::Notcapable),
-            Kind::Socket { .. }
-            | Kind::PipeTx { .. }
-            | Kind::PipeRx { .. }
-            | Kind::DuplexPipe { .. }
-            | Kind::EventNotifications { .. }
-            | Kind::Epoll { .. } => return Ok(Errno::Inval),
-            Kind::Symlink { .. } | Kind::File { .. } | Kind::Buffer { .. } => {
-                debug!("fatal internal logic error: parent of inode is not a directory");
-                return Ok(Errno::Inval);
-            }
+            _ => return Ok(Errno::Notdir),
         }
     };
-    let mut need_create = true;
     let target_guest_path = {
         let guard = target_parent_inode.read();
         match guard.deref() {
-            Kind::Dir { entries, path, .. } => {
-                if entries.contains_key(&target_entry_name) {
-                    need_create = false;
-                }
-                crate::fs::PosixPath::from_path(path)
-                    .join(&crate::fs::PosixPath::new(&target_entry_name))
-                    .into_path_buf()
-            }
+            Kind::Dir { path, .. } => crate::fs::PosixPath::from_path(path)
+                .join(&crate::fs::PosixPath::new(&target_entry_name))
+                .into_path_buf(),
             Kind::Root { .. } => return Ok(Errno::Notcapable),
-            Kind::Socket { .. }
-            | Kind::PipeTx { .. }
-            | Kind::PipeRx { .. }
-            | Kind::DuplexPipe { .. }
-            | Kind::EventNotifications { .. }
-            | Kind::Epoll { .. } => return Ok(Errno::Inval),
-            Kind::Symlink { .. } | Kind::File { .. } | Kind::Buffer { .. } => {
-                debug!("fatal internal logic error: parent of inode is not a directory");
-                return Ok(Errno::Inval);
-            }
+            _ => return Ok(Errno::Notdir),
         }
     };
-
-    if source_parent_inode.ino() == target_parent_inode.ino()
-        && source_entry_name == target_entry_name
+    if target_inode
+        .as_ref()
+        .is_some_and(|target| std::ptr::eq(target.deref(), source_inode.deref()))
     {
         return Ok(Errno::Success);
     }
 
-    let source_is_dir = {
+    // Keep new opens and handle replacement outside the namespace transition.
+    let _fd_map = state.fs.fd_map.write().unwrap();
+    let (source_is_dir, has_backing_entry) = {
         let guard = source_inode.read();
-        matches!(guard.deref(), Kind::Dir { .. })
+        (
+            matches!(guard.deref(), Kind::Dir { .. }),
+            matches!(
+                guard.deref(),
+                Kind::File { .. } | Kind::Dir { .. } | Kind::Symlink { .. }
+            ),
+        )
     };
     if source_is_dir
         && crate::fs::PosixPath::from_path(&target_guest_path)
@@ -163,156 +148,73 @@ pub fn path_rename_internal(
     {
         return Ok(Errno::Inval);
     }
-
-    let source_entry = {
-        let mut guard = source_parent_inode.write();
-        match guard.deref_mut() {
-            Kind::Dir { entries, .. } => {
-                wasi_try_ok!(entries.remove(&source_entry_name).ok_or(Errno::Noent))
-            }
-            Kind::Root { .. } => return Ok(Errno::Notcapable),
-            Kind::Socket { .. }
-            | Kind::PipeRx { .. }
-            | Kind::PipeTx { .. }
-            | Kind::DuplexPipe { .. }
-            | Kind::EventNotifications { .. }
-            | Kind::Epoll { .. } => {
-                return Ok(Errno::Inval);
-            }
-            Kind::Symlink { .. } | Kind::File { .. } | Kind::Buffer { .. } => {
-                debug!("fatal internal logic error: parent of inode is not a directory");
-                return Ok(Errno::Inval);
+    let is_ephemeral = state.fs.ephemeral_symlink_at(&source_guest_path).is_some();
+    wasi_try_ok!(__asyncify_light(env, None, source_inode.flush())?);
+    if let Some(target) = &target_inode {
+        wasi_try_ok!(__asyncify_light(env, None, target.flush())?);
+    }
+    if has_backing_entry {
+        let result = __asyncify_light(
+            env,
+            None,
+            state.fs_rename(&source_guest_path, &target_guest_path),
+        )?;
+        match result {
+            Ok(()) => {}
+            Err(Errno::Noent) if is_ephemeral => {}
+            Err(error) => return Ok(error),
+        }
+        // Native rename onto another hard link to the same file is a no-op.
+        if !is_ephemeral && target_inode.is_some() {
+            match state.fs.root_fs.symlink_metadata(&source_guest_path) {
+                Ok(_) => return Ok(Errno::Success),
+                Err(FsError::EntryNotFound) => {}
+                Err(error) => return Ok(fs_error_into_wasi_err(error)),
             }
         }
-    };
+    }
 
     {
-        let mut guard = source_entry.write();
-        match guard.deref_mut() {
-            Kind::File { path, .. } => {
-                let result = {
-                    let path_clone = path.clone();
-                    drop(guard);
-                    let state = state;
-                    let target_guest_path = target_guest_path.clone();
-                    __asyncify_light(env, None, async move {
-                        state.fs_rename(path_clone, &target_guest_path).await
-                    })?
-                };
-                // if the above operation failed we have to revert the previous change and then fail
-                if let Err(e) = result {
-                    let mut guard = source_parent_inode.write();
-                    if let Kind::Dir { entries, .. } = guard.deref_mut() {
-                        entries.insert(source_entry_name, source_entry);
-                        return Ok(e);
-                    }
-                } else {
-                    let mut guard = source_entry.write();
-                    if let Kind::File { path, .. } = guard.deref_mut() {
-                        *path = target_guest_path.clone();
-                    } else {
-                        unreachable!()
-                    }
-                }
-            }
-            Kind::Dir { path, .. } => {
-                let cloned_path = path.clone();
-                let res = {
-                    let state = state;
-                    let target_guest_path = target_guest_path.clone();
-                    __asyncify_light(env, None, async move {
-                        state.fs_rename(cloned_path, &target_guest_path).await
-                    })?
-                };
-                if let Err(e) = res {
-                    return Ok(e);
-                }
-                {
-                    let source_dir_path = path.clone();
-                    drop(guard);
-                    rename_inode_tree(&source_entry, &source_dir_path, &target_guest_path);
-                }
-            }
-            Kind::Symlink {
-                path_to_symlink,
-                relative_path,
-                ..
-            } => {
-                let is_ephemeral = state
-                    .fs
-                    .ephemeral_symlink_at(source_guest_path.as_path())
-                    .is_some();
-                let res = {
-                    let state = state;
-                    let from = source_guest_path.clone();
-                    let to = target_guest_path.clone();
-                    __asyncify_light(env, None, async move { state.fs_rename(from, to).await })?
-                };
-                match (res, is_ephemeral) {
-                    (Ok(()), _) | (Err(Errno::Noent), true) => {}
-                    (Err(e), _) => {
-                        let mut guard = source_parent_inode.write();
-                        if let Kind::Dir { entries, .. } = guard.deref_mut() {
-                            entries.insert(source_entry_name, source_entry.clone());
-                            return Ok(e);
-                        }
-                    }
-                }
-
-                let new_path_to_symlink = state
-                    .fs
-                    .rebase_symlink_location(target_guest_path.as_path());
-                *path_to_symlink = new_path_to_symlink.clone();
-                if is_ephemeral {
-                    state.fs.move_ephemeral_symlink(
-                        source_guest_path.as_path(),
-                        target_guest_path.as_path(),
-                        new_path_to_symlink,
-                        relative_path.clone(),
-                    );
-                    moved_ephemeral_symlink = true;
-                }
-            }
-            Kind::Buffer { .. }
-            | Kind::Socket { .. }
-            | Kind::PipeTx { .. }
-            | Kind::PipeRx { .. }
-            | Kind::DuplexPipe { .. }
-            | Kind::Epoll { .. }
-            | Kind::EventNotifications { .. } => {}
-            Kind::Root { .. } => unreachable!("The root can not be moved"),
+        let mut guard = source_parent_inode.write();
+        if let Kind::Dir { entries, .. } = guard.deref_mut() {
+            entries.remove(&source_entry_name);
         }
     }
-
-    let source_size = source_entry.stat.read().unwrap().st_size;
-
-    if need_create {
+    {
         let mut guard = target_parent_inode.write();
         if let Kind::Dir { entries, .. } = guard.deref_mut() {
-            let result = entries.insert(target_entry_name.clone(), source_entry);
-            assert!(
-                result.is_none(),
-                "fatal error: race condition on filesystem detected or internal logic error"
-            );
+            entries.insert(target_entry_name.clone(), source_inode.clone());
         }
     }
-
-    // The target entry is created, one way or the other
-    let target_inode = state
-        .fs
-        .get_inode_at_path(inodes, target_fd, target_path, true)
-        .expect("Expected target inode to exist, and it's too late to safely fail");
-    *target_inode.name.write().unwrap() = target_entry_name.into();
-    target_inode.stat.write().unwrap().st_size = source_size;
-
-    // If the rename replaced an existing destination entry, clear any stale
-    // ephemeral symlink mapping for that path.
-    if !moved_ephemeral_symlink {
-        state
-            .fs
-            .unregister_ephemeral_symlink(target_guest_path.as_path());
+    if let Some(target) = target_inode {
+        target.on_unlink();
     }
 
+    rename_inode_tree(&source_inode, &source_guest_path, &target_guest_path);
+    *source_inode.name.write().unwrap() = target_entry_name.into();
+    {
+        let mut guard = source_inode.write();
+        if let Kind::Symlink {
+            path_to_symlink,
+            relative_path,
+            ..
+        } = guard.deref_mut()
+        {
+            let new_path = state.fs.rebase_symlink_location(&target_guest_path);
+            *path_to_symlink = new_path.clone();
+            if is_ephemeral {
+                state.fs.move_ephemeral_symlink(
+                    &source_guest_path,
+                    &target_guest_path,
+                    new_path,
+                    relative_path.clone(),
+                );
+            }
+        }
+    }
+    if !is_ephemeral {
+        state.fs.unregister_ephemeral_symlink(&target_guest_path);
+    }
     Ok(Errno::Success)
 }
 

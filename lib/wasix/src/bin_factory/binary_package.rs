@@ -217,6 +217,8 @@ impl BinaryPackage {
                     anyhow::Ok(MappedDirectory {
                         host: dir.join(host).canonicalize()?,
                         guest,
+                        read_only: false,
+                        maximum_growth_bytes: None,
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?

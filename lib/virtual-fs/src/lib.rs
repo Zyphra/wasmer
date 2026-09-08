@@ -41,7 +41,9 @@ pub mod mem_fs;
 pub mod mount_fs;
 pub mod null_file;
 pub mod passthru_fs;
+mod quota_fs;
 pub mod random_file;
+mod read_only_fs;
 pub mod special_file;
 pub mod tmp_fs;
 pub mod zero_file;
@@ -72,6 +74,8 @@ pub use null_file::*;
 pub use overlay_fs::OverlayFileSystem;
 pub use passthru_fs::*;
 pub use pipe::*;
+pub use quota_fs::QuotaFileSystem;
+pub use read_only_fs::ReadOnlyFileSystem;
 pub use special_file::*;
 pub use static_file::StaticFile;
 pub use tmp_fs::*;
@@ -374,6 +378,11 @@ pub trait VirtualFile:
     /// handle is dropped.
     fn unlink(&mut self) -> Result<()>;
 
+    /// Notify an open handle after its last directory entry was removed through
+    /// the filesystem, including any filesystem-level storage accounting.
+    /// This must not remove a path or refund the removed contents again.
+    fn on_unlink(&mut self) {}
+
     /// Indicates if the file is opened or closed. This function must not block
     /// Defaults to a status of being constantly open
     fn is_open(&self) -> bool {
@@ -534,6 +543,9 @@ pub enum FsError {
     /// Caller was not allowed to perform this operation
     #[error("permission denied")]
     PermissionDenied,
+    /// The operation would mutate a read-only filesystem
+    #[error("read-only filesystem")]
+    ReadOnlyFilesystem,
     /// The operation did not complete within the given amount of time
     #[error("time out")]
     TimedOut,
@@ -575,12 +587,12 @@ impl From<io::Error> for FsError {
             io::ErrorKind::NotConnected => FsError::NotConnected,
             io::ErrorKind::NotFound => FsError::EntryNotFound,
             io::ErrorKind::PermissionDenied => FsError::PermissionDenied,
+            io::ErrorKind::ReadOnlyFilesystem => FsError::ReadOnlyFilesystem,
             io::ErrorKind::TimedOut => FsError::TimedOut,
             io::ErrorKind::UnexpectedEof => FsError::UnexpectedEof,
             io::ErrorKind::WouldBlock => FsError::WouldBlock,
             io::ErrorKind::WriteZero => FsError::WriteZero,
-            // NOTE: Add this once the "io_error_more" Rust feature is stabilized
-            // io::ErrorKind::StorageFull => FsError::StorageFull,
+            io::ErrorKind::StorageFull => FsError::StorageFull,
             io::ErrorKind::Other => FsError::IOError,
             // if the following triggers, a new error type was added to this non-exhaustive enum
             _ => FsError::UnknownError,
@@ -604,6 +616,7 @@ impl From<FsError> for io::Error {
             FsError::NotConnected => io::ErrorKind::NotConnected,
             FsError::EntryNotFound => io::ErrorKind::NotFound,
             FsError::PermissionDenied => io::ErrorKind::PermissionDenied,
+            FsError::ReadOnlyFilesystem => io::ErrorKind::ReadOnlyFilesystem,
             FsError::TimedOut => io::ErrorKind::TimedOut,
             FsError::UnexpectedEof => io::ErrorKind::UnexpectedEof,
             FsError::WouldBlock => io::ErrorKind::WouldBlock,
@@ -616,10 +629,8 @@ impl From<FsError> for io::Error {
             FsError::NoDevice => io::ErrorKind::Other,
             FsError::DirectoryNotEmpty => io::ErrorKind::Other,
             FsError::UnknownError => io::ErrorKind::Other,
-            FsError::StorageFull => io::ErrorKind::Other,
+            FsError::StorageFull => io::ErrorKind::StorageFull,
             FsError::Unsupported => io::ErrorKind::Unsupported,
-            // NOTE: Add this once the "io_error_more" Rust feature is stabilized
-            // FsError::StorageFull => io::ErrorKind::StorageFull,
         };
         kind.into()
     }

@@ -322,7 +322,7 @@ fn path_open_internal_with_symlink_depth(
             open_options.options(shared_config.clone());
             match open_options.open(path) {
                 Ok(handle) => Ok(handle),
-                Err(FsError::PermissionDenied)
+                Err(FsError::PermissionDenied | FsError::ReadOnlyFilesystem)
                     if shared_config.read != requested_config.read
                         || shared_config.write != requested_config.write =>
                 {

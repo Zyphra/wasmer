@@ -205,6 +205,33 @@ impl InodeGuard {
         trace!(ino = %self.ino.0, new_count = %(prev_handles + 1), "acquiring handle for InodeGuard");
     }
 
+    /// Complete pending writes before a namespace operation inspects backing metadata.
+    pub(crate) async fn flush(&self) -> Result<(), Errno> {
+        if let Some(file) = WasiFs::file_flush_target(self) {
+            FlushPoller { file }.await?;
+        }
+        Ok(())
+    }
+
+    /// Complete a successful namespace removal without invalidating open descriptors.
+    pub(crate) fn on_unlink(&self) {
+        let remaining_links = {
+            let mut stat = self.stat.write().unwrap();
+            stat.st_nlink = stat.st_nlink.checked_sub(1).expect("inode has no links");
+            stat.st_nlink
+        };
+        if remaining_links == 0 {
+            let guard = self.read();
+            if let Kind::File {
+                handle: Some(handle),
+                ..
+            } = guard.deref()
+            {
+                handle.write().unwrap().on_unlink();
+            }
+        }
+    }
+
     pub fn drop_one_handle(&self) {
         let prev_handles = self.open_handles.fetch_sub(1, Ordering::SeqCst);
 
@@ -2854,6 +2881,7 @@ pub fn fs_error_from_wasi_err(err: Errno) -> FsError {
         Errno::Nodev => FsError::NoDevice,
         Errno::Noent => FsError::EntryNotFound,
         Errno::Perm => FsError::PermissionDenied,
+        Errno::Rofs => FsError::ReadOnlyFilesystem,
         Errno::Timedout => FsError::TimedOut,
         Errno::Proto => FsError::UnexpectedEof,
         Errno::Again => FsError::WouldBlock,
@@ -2883,12 +2911,13 @@ pub fn fs_error_into_wasi_err(fs_error: FsError) -> Errno {
         FsError::NotConnected => Errno::Notconn,
         FsError::EntryNotFound => Errno::Noent,
         FsError::PermissionDenied => Errno::Perm,
+        FsError::ReadOnlyFilesystem => Errno::Rofs,
         FsError::TimedOut => Errno::Timedout,
         FsError::UnexpectedEof => Errno::Proto,
         FsError::WouldBlock => Errno::Again,
         FsError::WriteZero => Errno::Nospc,
         FsError::DirectoryNotEmpty => Errno::Notempty,
-        FsError::StorageFull => Errno::Overflow,
+        FsError::StorageFull => Errno::Nospc,
         FsError::Lock | FsError::UnknownError => Errno::Io,
         FsError::Unsupported => Errno::Notsup,
     }

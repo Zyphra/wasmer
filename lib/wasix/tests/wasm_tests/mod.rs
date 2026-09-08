@@ -1142,6 +1142,8 @@ fn configure_mapped_directories(
             host_mapped_directories.push(wasmer_wasix::runners::MappedDirectory {
                 host,
                 guest: directory.guest.clone(),
+                read_only: false,
+                maximum_growth_bytes: None,
             });
         } else {
             let fs = match &directory.host {
