@@ -58,18 +58,28 @@ pub fn parse_volume(entry: &str) -> Result<MappedDirectory> {
     }
 }
 
-/// Parses a guest volume growth limit in the form `<GUEST_DIR>=<MAX_BYTES>`.
-pub fn parse_volume_growth_limit(entry: &str) -> Result<(String, u64)> {
-    let (guest, maximum_growth_bytes) = entry
-        .rsplit_once('=')
-        .context("volume growth limit must be <GUEST_DIR>=<MAX_BYTES>")?;
-    if guest.is_empty() {
-        bail!("volume growth limit guest directory cannot be empty");
+/// Parses a complete mount declaration without introducing path delimiter escaping.
+pub fn parse_mount(entry: &str) -> Result<MappedDirectory> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Mount {
+        source: String,
+        target: String,
+        #[serde(default)]
+        read_only: bool,
+        max_growth_bytes: Option<u64>,
     }
-    let maximum_growth_bytes = maximum_growth_bytes
-        .parse::<u64>()
-        .context("volume growth limit must be an integer number of bytes")?;
-    Ok((guest.to_string(), maximum_growth_bytes))
+    let mount: Mount = serde_json::from_str(entry).context("mount must be a JSON object")?;
+    if mount.source.is_empty() || mount.target.is_empty() {
+        bail!("mount source and target cannot be empty");
+    }
+    if mount.read_only && mount.max_growth_bytes.is_some() {
+        bail!("read-only mounts cannot have a growth limit");
+    }
+    let mut mapped = retrieve_alias_pathbuf(&mount.source, &mount.target)?;
+    mapped.read_only = mount.read_only;
+    mapped.maximum_growth_bytes = mount.max_growth_bytes;
+    Ok(mapped)
 }
 
 /// Parses a mapdir(legacy option) from a string.
@@ -234,13 +244,27 @@ c: c
     }
 
     #[test]
-    fn test_parse_volume_growth_limit() {
-        assert_eq!(
-            parse_volume_growth_limit("/shared=1048576").unwrap(),
-            ("/shared".into(), 1_048_576)
-        );
-        assert!(parse_volume_growth_limit("/shared").is_err());
-        assert!(parse_volume_growth_limit("=1").is_err());
-        assert!(parse_volume_growth_limit("/shared=-1").is_err());
+    fn test_parse_mount() {
+        let directory = tempfile::tempdir().unwrap();
+        let value = serde_json::json!({"source": directory.path(), "target": "/cache", "max_growth_bytes": 42});
+        let mount = parse_mount(&value.to_string()).unwrap();
+        assert_eq!(mount.maximum_growth_bytes, Some(42));
+        assert!(!mount.read_only);
+        for extra in [
+            serde_json::json!({"max_growth_bytes": -1}),
+            serde_json::json!({"max_growth_bytes": true}),
+            serde_json::json!({"read_only": true, "max_growth_bytes": 1}),
+            serde_json::json!({"unknown": 1}),
+        ] {
+            let mut invalid = value.clone();
+            invalid
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            assert!(parse_mount(&invalid.to_string()).is_err());
+        }
+        let readonly = serde_json::json!({"source": directory.path(), "target": "/reference", "read_only": true});
+        assert!(parse_mount(&readonly.to_string()).unwrap().read_only);
+        assert!(parse_mount(r#"{"source":".","target":"a","target":"b"}"#).is_err());
     }
 }
