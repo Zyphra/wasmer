@@ -36,6 +36,10 @@ The corresponding `MappedDirectory` fields default to writable and unlimited.
 - Deletion and replacement finish pending writes before consulting backing
   metadata. They coordinate with shared-handle installation through the existing
   fd-map lock; they do not introduce a second open-file registry.
+- Before `path_open` replaces an existing regular-file handle, it flushes pending
+  writes on that handle. Quota wrappers initialize per-handle size from backing
+  metadata, so replacement must not race writes already accepted by the old
+  handle. This adds no accounting state and is a flush, not a durability `fsync`.
 - Successful rename replaces the cached destination inode while old descriptors
   retain the displaced inode. Compare inode objects, not path-derived inode
   numbers, when identifying a same-file rename. Failed operations retain entries.
@@ -96,8 +100,11 @@ cargo build --locked -p wasmer-cli --no-default-features --features cranelift,wa
 Run PyWasmer RPC tests against that newly built binary: quota exhaustion and
 worker survival, deletion/shrink refunds, repeated replacement with old handles
 open, moves between directories, truncation through another descriptor, and
-unlinked growth released on last close. Also check failed rename, directories,
-symlinks, and read-only errors. Initial results: 130 filesystem tests passed
+unlinked growth released on last close. The truncation test must write to one
+descriptor and immediately open a second writable descriptor without an explicit
+flush; this verifies that handle replacement cannot initialize quota state from
+stale backing metadata. Also check failed rename, directories, symlinks, and
+read-only errors. Initial results: 130 filesystem tests passed
 (two existing ignores), four CLI volume tests, and 12 quota RPC cases passed.
 
 After review, update the published branch with `git push --force-with-lease origin

@@ -414,6 +414,24 @@ fn path_open_internal_with_symlink_depth(
             file_open_flags |= Fd::TRUNCATE;
         }
 
+        // Reopening a writable file replaces the inode's shared handle below. Finish
+        // writes accepted by the old handle first so wrappers that initialize state
+        // from backing metadata (such as QuotaFileSystem) do not observe a stale size.
+        let replaces_existing_handle = requires_stronger_handle && {
+            let guard = inode.read();
+            matches!(
+                guard.deref(),
+                Kind::File {
+                    handle: Some(_),
+                    fd: None,
+                    ..
+                }
+            )
+        };
+        if replaces_existing_handle {
+            wasi_try_ok!(__asyncify_light(env, None, inode.flush())?);
+        }
+
         // Phase B: fd_map first; every inode-dependent decision under lock. For regular
         // files keep inode write through insert_fd so handle install and acquire_handle()
         // cannot interleave with close on this inode.
