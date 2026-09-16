@@ -429,7 +429,7 @@ fn path_open_internal_with_symlink_depth(
             )
         };
         if replaces_existing_handle {
-            wasi_try_ok!(__asyncify_light(env, None, inode.flush())?);
+            wasi_try_ok_ok!(__asyncify_light(env, None, inode.flush())?);
         }
 
         // Phase B: fd_map first; every inode-dependent decision under lock. For regular
