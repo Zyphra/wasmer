@@ -1,10 +1,10 @@
 use std::{collections::VecDeque, task::Waker};
 
-use virtual_fs::{AsyncReadExt, DeviceFile, ReadBuf};
+use virtual_fs::{AsyncReadExt, DeviceFile, Pipe, PipeRx, ReadBuf};
 
 use super::*;
 use crate::{
-    fs::NotificationInner,
+    fs::{NotificationInner, VirtualFileLock},
     journal::SnapshotTrigger,
     net::socket::TimeType,
     os::task::process::{MaybeCheckpointResult, WasiProcessCheckpoint, WasiProcessInner},
@@ -142,6 +142,13 @@ pub(crate) fn fd_read_internal<M: MemorySize>(
     nread: WasmPtr<M::Offset, M>,
     should_update_cursor: bool,
 ) -> WasiResult<usize> {
+    // The read below blocks without cooperating, so wait for data where that can take forever.
+    if !fd_entry.inner.flags.contains(Fdflags::NONBLOCK)
+        && let Some(readable) = read_readiness(&fd_entry)
+    {
+        __asyncify_cooperative(ctx, readable)?;
+    }
+
     let env = ctx.data();
     let memory = unsafe { env.memory_view(&ctx) };
     let state = env.state();
@@ -469,4 +476,40 @@ pub(crate) fn fd_read_internal<M: MemorySize>(
     };
 
     Ok(Ok(bytes_read))
+}
+
+/// A read source that can block indefinitely, polled only for readiness.
+enum BlockingSource {
+    Stdio(VirtualFileLock),
+    Pipe(PipeRx),
+    Duplex(Pipe),
+}
+
+/// Resolves once a read from `fd_entry` would make progress, without touching guest
+/// memory. `None` for sources that never block for long, such as regular files.
+fn read_readiness(fd_entry: &Fd) -> Option<impl Future<Output = ()> + Send + Sync + 'static> {
+    if !fd_entry.is_stdio && !fd_entry.inner.rights.contains(Rights::FD_READ) {
+        return None;
+    }
+    let mut source = match fd_entry.inode.read().deref() {
+        Kind::File {
+            handle: Some(handle),
+            ..
+        } if fd_entry.is_stdio => BlockingSource::Stdio(handle.clone()),
+        Kind::PipeRx { rx } => BlockingSource::Pipe(rx.clone()),
+        Kind::DuplexPipe { pipe } => BlockingSource::Duplex(pipe.clone()),
+        _ => return None,
+    };
+    Some(std::future::poll_fn(move |cx| {
+        // Errors, including EOF, are left for the read itself to report.
+        let ready = match &mut source {
+            BlockingSource::Stdio(handle) => match handle.write() {
+                Ok(mut file) => Pin::new(&mut **file).poll_read_ready(cx),
+                Err(_) => return Poll::Ready(()),
+            },
+            BlockingSource::Pipe(rx) => Pin::new(rx).poll_read_ready(cx),
+            BlockingSource::Duplex(pipe) => Pin::new(pipe).poll_read_ready(cx),
+        };
+        ready.map(|_| ())
+    }))
 }

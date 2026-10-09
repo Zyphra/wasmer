@@ -884,7 +884,7 @@ impl VirtualFile for Stdin {
         let _guard = Handle::try_current().map_err(|_| self.handle.enter());
         let inner = Pin::new(&mut self.inner);
 
-        let mut buf = [0u8; 8192];
+        let mut buf = [0u8; 65536];
         let mut read_buf = ReadBuf::new(&mut buf[..]);
         match inner.poll_read(cx, &mut read_buf) {
             Poll::Pending => Poll::Pending,

@@ -586,6 +586,23 @@ where
     Ok(block_on(work))
 }
 
+/// Blocks on `work` like [`__asyncify_light`], but keeps servicing linker operations
+/// and signals while it is pending. A thread blocked without servicing them stalls
+/// every other thread's `dlopen`, which needs all threads to cooperate.
+pub(crate) fn __asyncify_cooperative<Fut>(
+    ctx: &mut FunctionEnvMut<'_, WasiEnv>,
+    work: Fut,
+) -> Result<Fut::Output, WasiError>
+where
+    Fut: Future + Send + Sync + 'static,
+{
+    let mut work = Box::pin(work);
+    block_on(AsyncifyPoller {
+        ctx,
+        work: &mut work,
+    })
+}
+
 // This should be compiled away, it will simply wait forever however its never
 // used by itself, normally this is passed into asyncify which will still abort
 // the operating on timeouts, signals or other work due to a select! around the await
