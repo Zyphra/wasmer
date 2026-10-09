@@ -2,10 +2,13 @@
 
 ## Purpose and base
 
-This fork adds mounted-volume policies for PyWasmer workers. The maintained
-branch is `zyphra`; upstream is `https://github.com/wasmerio/wasmer.git`.
-The initial base is upstream `v7.2.1`, commit
-`c14032594b893b40e9b71456d504cf55c141c8f6`.
+This fork adds mounted-volume policies for PyWasmer workers, plus a blocking-read
+fix documented separately in [ZYPHRA_FD_READ.md](./ZYPHRA_FD_READ.md). The
+maintained branch is `zyphra`; upstream is `https://github.com/wasmerio/wasmer.git`.
+The current base is upstream `v7.5.0`, commit
+`82ff099e082da586b38af79986abbb8b677f8baf` (previously `v7.2.1`, commit
+`c14032594b893b40e9b71456d504cf55c141c8f6`; that branch is kept as
+`backup/zyphra-7.2.1`).
 
 The CLI accepts one JSON mount declaration, for example:
 
@@ -64,20 +67,26 @@ every syscall's read-only semantics.
 
 No 512 MiB default or MAIA wiring is added here. PyWasmer configuration and Python
 RPC regression tests live in the separate PyWasmer checkout. Official Wasmer
-7.2.1 binaries do not implement these flags; distribution must pin a fork build.
+binaries do not implement these flags; distribution must pin a fork build.
 
 ## Updating upstream
 
-Fetch upstream tags, back up the maintained branch, then rebase only our patches:
+Fetch upstream tags, back up the maintained branch, then replay only our patches
+onto the new tag. Cherry-pick rather than `git rebase --onto`: the submodule
+checkout is shallow, so old and new tags share no history and rebase cannot find
+the patches' base. Cherry-pick only needs each patch and its parent.
 
 ```sh
 git fetch upstream --tags
-git switch zyphra
-git branch backup/zyphra-before-upstream-update
-git rebase --onto <new-upstream-tag> <previous-upstream-base> zyphra
+git branch backup/zyphra-<previous-version> zyphra
+git switch -c zyphra-<new-version> <new-upstream-tag>
+git cherry-pick <previous-upstream-base>..zyphra   # or list the fork commits
+git submodule update --init --depth=1 lib/napi wasmer-test-files
 ```
 
-Use the base recorded above for the first update, and update it after each rebase.
+Update the base recorded above after each replay. Upstream also moves the Rust
+toolchain (`rust-toolchain.toml`) and occasionally LLVM (`inkwell`'s `llvmNN-M`
+feature); MAIA's native recipe in `.dev/wasmer/` pins both and must follow.
 Preserve behavior rather than restoring old code if upstream changes its APIs:
 
 - `virtual-fs/{quota_fs,read_only_fs,lib,host_fs}.rs`: accounting, notification
@@ -86,6 +95,24 @@ Preserve behavior rather than restoring old code if upstream changes its APIs:
   ownership, lock order, namespace identity, and exactly-once removal notification.
 - `runners/wasi_common.rs`, CLI parsing, and `path_open2.rs`: mount policies,
   normalization, constructor defaults, and read-only open fallback.
+
+Before replaying, diff the `virtual-fs` `FileSystem` and `VirtualFile` traits
+between the two tags. A new method with a default implementation compiles but
+bypasses the quota and read-only wrappers until they override it.
+
+The `v7.2.1` to `v7.5.0` replay conflicted in three places:
+
+- `wasi_common.rs`: upstream replaced `cfg_if!` with `cfg_select!` and added
+  `os_env_vars` beside the free `normalized_mount_path`, which our patch moves
+  into `MappedDirectory::normalize_guest_path`. Keep `os_env_vars`, drop the free
+  function, and port the policy wrappers into the `cfg_select!` arm.
+- `path_unlink_file.rs`: upstream returns `NOENT` (or removes an ephemeral
+  symlink) when the parent has no entry, and routes symlink removal through
+  `WasiFs::remove_symlink_file`. Keep our order (flush, remove backing file,
+  remove the entry, `on_unlink`) and take both upstream behaviors, checking the
+  missing entry first as upstream does.
+- `cli/.../run/wasi.rs`: both sides added a test module at the end of the file;
+  keep both.
 
 Use the checked-in Rust toolchain. Run formatting, virtual-fs tests, CLI volume
 tests, and a CLI build. The initial validation used:
@@ -106,6 +133,14 @@ flush; this verifies that handle replacement cannot initialize quota state from
 stale backing metadata. Also check failed rename, directories, symlinks, and
 read-only errors. Initial results: 130 filesystem tests passed
 (two existing ignores), four CLI volume tests, and 12 quota RPC cases passed.
+
+The `v7.5.0` replay was validated the same way, plus
+`cargo test --locked -p wasmer-wasix --features sys,host-fs --lib` and the
+`lint-packages` clippy flags on the touched crates: 136 virtual-fs tests (two
+existing ignores), two CLI volume tests (the JSON `--mount` rework left two),
+230 wasix unit tests (two existing ignores), and 37 volume/quota/read-only cases
+of PyWasmer `tests/test_rpc_behavior.py` on both RPC and RPCM. A local LLVM build
+needs `libffi-dev` and `libxml2-dev`, as installed by MAIA's Dockerfile.
 
 After review, update the published branch with `git push --force-with-lease origin
 zyphra` and pin consumers to the new tested commit/build.
