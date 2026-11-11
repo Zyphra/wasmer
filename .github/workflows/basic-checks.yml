@@ -1,0 +1,20 @@
+name: basic-checks
+
+on:
+  pull_request:
+  push:
+    branches: [zyphra]
+
+permissions:
+  contents: read
+
+jobs:
+  basic-checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Fetch lib/napi (workspace member)
+        run: git submodule update --init --depth 1 lib/napi
+      - name: Rust formatting
+        run: cargo fmt --all -- --check
